@@ -829,7 +829,7 @@ function registerViewDetailsTool(server, registerWithAllAliases) {
             // Get approximate row count
             rowCountResult = await executeQuery(`
                 SELECT 
-                    p.rows AS RowCount
+                    p.rows AS [RowCount]
                 FROM 
                     sys.views v
                     INNER JOIN sys.partitions p ON v.object_id = p.object_id
@@ -1197,7 +1197,7 @@ function registerDiscoverTablesTool(server, registerWithAlias) {
                         try {
                             const countResult = await executeQuery(`
                                 SELECT 
-                                    SUM(p.rows) AS RowCount
+                                    SUM(p.rows) AS [RowCount]
                                 FROM 
                                     sys.partitions p
                                 INNER JOIN 
