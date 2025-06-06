@@ -204,105 +204,217 @@ function registerExecuteQueryTool(server, registerWithAllAliases) {
  * @param {function} registerWithAllAliases - Helper to register with all name variants
  */
 function registerTableDetailsTool(server, registerWithAllAliases) {
-    const schema = { 
-        tableName: z.string().min(1, "Table name cannot be empty") 
+    const schema = {
+        tableName: z.string(),
+        random_string: z.string().optional()
     };
-    
-    const handler = async ({ tableName }) => {
+
+    const handler = async (args) => {
+        // Initialize all result variables
+        let columnsResult = { recordset: [] };
+        let indexesResult = { recordset: [] };
+        let fkResult = { recordset: [] };
+        let pkResult = { recordset: [] };
+        let tableInfoResult = { recordset: [] };
+        let rowCountResult = { recordset: [] };
+
         try {
-            // Parse schema and table name
-            let schemaName = 'dbo'; // Default schema
-            let tableNameOnly = tableName;
-            
-            // Handle schema-qualified table names (schema.table)
-            if (tableName.includes('.')) {
-                const parts = tableName.split('.');
-                schemaName = parts[0].replace(/[\[\]]/g, ''); // Remove any brackets
-                tableNameOnly = parts[1].replace(/[\[\]]/g, ''); // Remove any brackets
-            }
-            
-            // Sanitize table name components
-            const sanitizedSchema = sanitizeSqlIdentifier(schemaName);
-            const sanitizedTable = sanitizeSqlIdentifier(tableNameOnly);
-            
-            // Check if the sanitization changed anything
-            if (sanitizedSchema !== schemaName || sanitizedTable !== tableNameOnly) {
+            // Get table info
+            tableInfoResult = await executeQuery(`
+                SELECT 
+                    TABLE_SCHEMA,
+                    TABLE_NAME,
+                    TABLE_TYPE
+                FROM 
+                    INFORMATION_SCHEMA.TABLES
+                WHERE 
+                    TABLE_NAME = @tableName
+            `, {
+                tableName: args.tableName
+            });
+
+            if (!tableInfoResult.recordset.length) {
                 return {
                     content: [{
                         type: "text",
-                        text: `Invalid table name components: ${tableName}. Table and schema names should only contain alphanumeric characters and underscores.`
+                        text: `Table '${args.tableName}' not found.`
                     }],
                     isError: true
                 };
             }
-            
-            // Query for table details with schema qualification
-                const result = await executeQuery(`
-                    SELECT 
-                        COLUMN_NAME,
-                        DATA_TYPE,
-                        CHARACTER_MAXIMUM_LENGTH,
-                        IS_NULLABLE,
-                        COLUMN_DEFAULT
-                    FROM 
-                        INFORMATION_SCHEMA.COLUMNS
-                    WHERE 
-                    TABLE_SCHEMA = @schemaName AND
-                        TABLE_NAME = @tableName
-                    ORDER BY 
-                        ORDINAL_POSITION
-            `, { 
-                schemaName: sanitizedSchema,
-                tableName: sanitizedTable
+
+            // Get columns
+            columnsResult = await executeQuery(`
+                SELECT 
+                    COLUMN_NAME,
+                    DATA_TYPE,
+                    CHARACTER_MAXIMUM_LENGTH,
+                    IS_NULLABLE,
+                    COLUMN_DEFAULT
+                FROM 
+                    INFORMATION_SCHEMA.COLUMNS
+                WHERE 
+                    TABLE_NAME = @tableName
+                ORDER BY 
+                    ORDINAL_POSITION
+            `, {
+                tableName: args.tableName
             });
-                
-                if (result.recordset.length === 0) {
-                    return {
-                        content: [{
-                            type: "text",
-                        text: `Table '${sanitizedSchema}.${sanitizedTable}' not found.`
-                        }],
-                        isError: true
-                    };
-                }
-                
-            // Format response as markdown table
-            let markdown = `# Table: ${sanitizedSchema}.${sanitizedTable}\n\n`;
+
+            // Get indexes
+            indexesResult = await executeQuery(`
+                SELECT 
+                    i.name AS IndexName,
+                    i.type_desc AS IndexType,
+                    STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS Columns,
+                    i.is_unique AS IsUnique
+                FROM 
+                    sys.indexes i
+                    INNER JOIN sys.tables t ON i.object_id = t.object_id
+                    INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+                    INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                WHERE 
+                    t.name = @tableName
+                GROUP BY
+                    i.name, i.type_desc, i.is_unique
+            `, {
+                tableName: args.tableName
+            });
+
+            // Get foreign keys
+            fkResult = await executeQuery(`
+                SELECT 
+                    fk.name AS FKName,
+                    OBJECT_NAME(fk.parent_object_id) AS TableName,
+                    c1.name AS ColumnName,
+                    OBJECT_NAME(fk.referenced_object_id) AS ReferencedTableName,
+                    c2.name AS ReferencedColumnName
+                FROM 
+                    sys.foreign_keys fk
+                    INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+                    INNER JOIN sys.columns c1 ON fkc.parent_object_id = c1.object_id AND fkc.parent_column_id = c1.column_id
+                    INNER JOIN sys.columns c2 ON fkc.referenced_object_id = c2.object_id AND fkc.referenced_column_id = c2.column_id
+                WHERE 
+                    OBJECT_NAME(fk.parent_object_id) = @tableName
+            `, {
+                tableName: args.tableName
+            });
+
+            // Get primary key
+            pkResult = await executeQuery(`
+                SELECT 
+                    c.name AS ColumnName
+                FROM 
+                    sys.indexes i
+                    INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+                    INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                    INNER JOIN sys.tables t ON i.object_id = t.object_id
+                WHERE 
+                    i.is_primary_key = 1
+                    AND t.name = @tableName
+                ORDER BY 
+                    ic.key_ordinal
+            `, {
+                tableName: args.tableName
+            });
+
+            // Get approximate row count
+            rowCountResult = await executeQuery(`
+                SELECT 
+                    p.rows AS [RowCount]
+                FROM 
+                    sys.tables t
+                    INNER JOIN sys.partitions p ON t.object_id = p.object_id
+                WHERE 
+                    t.name = @tableName
+                    AND p.index_id IN (0,1)
+            `, {
+                tableName: args.tableName
+            });
+
+            // Format the output as markdown
+            const tableInfo = tableInfoResult.recordset[0];
+            let markdown = `# Table: ${tableInfo.TABLE_SCHEMA}.${tableInfo.TABLE_NAME}\n\n`;
+            
+            // Add row count if available
+            if (rowCountResult.recordset.length > 0) {
+                markdown += `Approximate row count: ${rowCountResult.recordset[0].RowCount}\n\n`;
+            }
+
+            // Columns section
             markdown += `## Columns\n\n`;
-            markdown += `| Column Name | Data Type | Max Length | Nullable | Default |\n`;
-            markdown += `|-------------|-----------|------------|----------|----------|\n`;
-            
-            result.recordset.forEach(column => {
-                markdown += `| ${column.COLUMN_NAME} | ${column.DATA_TYPE} | ${column.CHARACTER_MAXIMUM_LENGTH || 'N/A'} | ${column.IS_NULLABLE} | ${column.COLUMN_DEFAULT || 'NULL'} |\n`;
+            markdown += `| Column | Type | Length | Nullable | Default |\n`;
+            markdown += `| ------ | ---- | ------ | -------- | ------- |\n`;
+            columnsResult.recordset.forEach(col => {
+                const length = col.CHARACTER_MAXIMUM_LENGTH === -1 ? 'MAX' : 
+                             col.CHARACTER_MAXIMUM_LENGTH || '';
+                markdown += `| ${col.COLUMN_NAME} | ${col.DATA_TYPE} | ${length} | ${col.IS_NULLABLE} | ${col.COLUMN_DEFAULT || ''} |\n`;
             });
-            
-            // Return both the formatted markdown and the structured data
-                return {
-                    content: [{
-                        type: "text",
-                        text: markdown
+
+            // Primary Key section
+            if (pkResult.recordset.length > 0) {
+                markdown += `\n## Primary Key\n\n`;
+                markdown += pkResult.recordset.map(pk => pk.ColumnName).join(', ') + '\n';
+            }
+
+            // Indexes section
+            if (indexesResult.recordset.length > 0) {
+                markdown += `\n## Indexes\n\n`;
+                markdown += `| Name | Type | Columns | Unique |\n`;
+                markdown += `| ---- | ---- | ------- | ------ |\n`;
+                indexesResult.recordset.forEach(idx => {
+                    markdown += `| ${idx.IndexName} | ${idx.IndexType} | ${idx.Columns} | ${idx.IsUnique ? 'Yes' : 'No'} |\n`;
+                });
+            }
+
+            // Foreign Keys section
+            if (fkResult.recordset.length > 0) {
+                markdown += `\n## Foreign Keys\n\n`;
+                markdown += `| Name | Column | References |\n`;
+                markdown += `| ---- | ------ | ---------- |\n`;
+                fkResult.recordset.forEach(fk => {
+                    markdown += `| ${fk.FKName} | ${fk.ColumnName} | ${fk.ReferencedTableName}(${fk.ReferencedColumnName}) |\n`;
+                });
+            }
+
+            // Add usage examples
+            markdown += `\n## Usage Examples\n\n`;
+            markdown += `### Query Table\n`;
+            markdown += "```sql\n";
+            markdown += `SELECT TOP 10 * FROM ${tableInfo.TABLE_SCHEMA}.${tableInfo.TABLE_NAME}\n`;
+            markdown += "```\n\n";
+            markdown += `### Count Rows\n`;
+            markdown += "```sql\n";
+            markdown += `SELECT COUNT(*) FROM ${tableInfo.TABLE_SCHEMA}.${tableInfo.TABLE_NAME}\n`;
+            markdown += "```\n";
+
+            return {
+                content: [{
+                    type: "text",
+                    text: markdown
                 }],
                 result: {
-                    columns: result.recordset || [],
-                    metadata: {
-                        rowCount: result.recordset.length,
-                        tableName: `${sanitizedSchema}.${sanitizedTable}`
-                    }
+                    tableInfo: tableInfo,
+                    columns: columnsResult.recordset || [],
+                    indexes: indexesResult.recordset || [],
+                    foreignKeys: fkResult.recordset || [],
+                    primaryKey: pkResult.recordset || [],
+                    rowCount: rowCountResult.recordset[0]?.RowCount
                 }
-                };
-            } catch (err) {
-                logger.error(`Error getting table details: ${err.message}`);
-                
-                return {
-                    content: [{
-                        type: "text",
-                        text: `Error getting table details: ${formatSqlError(err)}`
-                    }],
-                    isError: true
-                };
-            }
+            };
+        } catch (err) {
+            logger.error(`Error in table details tool: ${err.message}`);
+            return {
+                content: [{
+                    type: "text",
+                    text: `Error getting table details: ${formatSqlError(err)}`
+                }],
+                isError: true
+            };
+        }
     };
-    
+
+    // Register with all aliases
     if (registerWithAllAliases) {
         registerWithAllAliases("table_details", schema, handler);
     } else {
@@ -315,107 +427,140 @@ function registerTableDetailsTool(server, registerWithAllAliases) {
  * @param {object} server - MCP server instance
  * @param {function} registerWithAlias - Optional helper to register with aliases
  */
-function registerProcedureDetailsTool(server, registerWithAlias) {
-    const handler = async ({ procedureName }) => {
-            try {
-                // Sanitize procedure name
-                const sanitizedProcName = sanitizeSqlIdentifier(procedureName);
-                
-                if (sanitizedProcName !== procedureName) {
-                    return {
-                        content: [{
-                            type: "text",
-                            text: `Invalid procedure name: ${procedureName}. Procedure names should only contain alphanumeric characters and underscores.`
-                        }],
-                        isError: true
-                    };
-                }
-                
-                const result = await executeQuery(`
-                    SELECT 
-                        ROUTINE_DEFINITION
-                    FROM 
-                        INFORMATION_SCHEMA.ROUTINES
-                    WHERE 
-                        ROUTINE_TYPE = 'PROCEDURE' AND
-                        ROUTINE_NAME = @procedureName
-                `, { procedureName: sanitizedProcName });
-                
-                if (result.recordset.length === 0) {
-                    return {
-                        content: [{
-                            type: "text",
-                            text: `Stored procedure '${sanitizedProcName}' not found.`
-                        }],
-                        isError: true
-                    };
-                }
-                
-                // Get parameters
-                const paramResult = await executeQuery(`
-                    SELECT 
-                        PARAMETER_NAME,
-                        DATA_TYPE,
-                        PARAMETER_MODE
-                    FROM 
-                        INFORMATION_SCHEMA.PARAMETERS
-                    WHERE 
-                        SPECIFIC_NAME = @procedureName
-                    ORDER BY 
-                        ORDINAL_POSITION
-                `, { procedureName: sanitizedProcName });
-                
-                let markdown = `# Stored Procedure: ${sanitizedProcName}\n\n`;
-                
-                if (paramResult.recordset.length > 0) {
-                    markdown += '## Parameters\n\n';
-                    markdown += '| Name | Type | Mode |\n';
-                    markdown += '|------|------|------|\n';
-                    
-                    paramResult.recordset.forEach(param => {
-                        markdown += `| ${param.PARAMETER_NAME} | ${param.DATA_TYPE} | ${param.PARAMETER_MODE} |\n`;
-                    });
-                    
-                    markdown += '\n';
-                }
-                
-                markdown += '## Definition\n\n';
-                markdown += '```sql\n';
-                markdown += result.recordset[0].ROUTINE_DEFINITION || 'Definition not available';
-                markdown += '\n```\n';
-                
+function registerProcedureDetailsTool(server, registerWithAllAliases) {
+    const schema = {
+        procedureName: z.string(),
+        random_string: z.string().optional()
+    };
+
+    const handler = async (args) => {
+        // Initialize all result variables
+        let procInfoResult = { recordset: [] };
+        let paramsResult = { recordset: [] };
+        let definitionResult = { recordset: [] };
+
+        try {
+            // Get procedure info
+            procInfoResult = await executeQuery(`
+                SELECT 
+                    SPECIFIC_SCHEMA,
+                    SPECIFIC_NAME,
+                    ROUTINE_TYPE,
+                    CREATED,
+                    LAST_ALTERED
+                FROM 
+                    INFORMATION_SCHEMA.ROUTINES
+                WHERE 
+                    ROUTINE_TYPE = 'PROCEDURE'
+                    AND SPECIFIC_NAME = @procedureName
+            `, {
+                procedureName: args.procedureName
+            });
+
+            if (!procInfoResult.recordset.length) {
                 return {
                     content: [{
                         type: "text",
-                        text: markdown
-                }],
-                result: {
-                    procedureName: sanitizedProcName,
-                    parameters: paramResult.recordset || [],
-                    definition: result.recordset[0].ROUTINE_DEFINITION || 'Definition not available'
-                }
-                };
-            } catch (err) {
-                logger.error(`Error getting procedure details: ${err.message}`);
-                
-                return {
-                    content: [{
-                        type: "text",
-                        text: `Error getting procedure details: ${formatSqlError(err)}`
+                        text: `Stored procedure '${args.procedureName}' not found.`
                     }],
                     isError: true
                 };
             }
+
+            // Get parameters
+            paramsResult = await executeQuery(`
+                SELECT 
+                    PARAMETER_NAME,
+                    DATA_TYPE,
+                    CHARACTER_MAXIMUM_LENGTH,
+                    PARAMETER_MODE
+                FROM 
+                    INFORMATION_SCHEMA.PARAMETERS
+                WHERE 
+                    SPECIFIC_NAME = @procedureName
+                ORDER BY 
+                    ORDINAL_POSITION
+            `, {
+                procedureName: args.procedureName
+            });
+
+            // Get procedure definition
+            definitionResult = await executeQuery(`
+                SELECT 
+                    OBJECT_DEFINITION(OBJECT_ID(@procedureName)) AS Definition
+            `, {
+                procedureName: args.procedureName
+            });
+
+            // Format the output as markdown
+            const procInfo = procInfoResult.recordset[0];
+            let markdown = `# Stored Procedure: ${procInfo.SPECIFIC_SCHEMA}.${procInfo.SPECIFIC_NAME}\n\n`;
+
+            // Add creation and modification dates
+            markdown += `Created: ${procInfo.CREATED}\n`;
+            markdown += `Last Modified: ${procInfo.LAST_ALTERED}\n\n`;
+
+            // Parameters section
+            if (paramsResult.recordset.length > 0) {
+                markdown += `## Parameters\n\n`;
+                markdown += `| Parameter | Type | Length | Mode |\n`;
+                markdown += `| --------- | ---- | ------ | ---- |\n`;
+                paramsResult.recordset.forEach(param => {
+                    const length = param.CHARACTER_MAXIMUM_LENGTH === -1 ? 'MAX' : 
+                                 param.CHARACTER_MAXIMUM_LENGTH || '';
+                    markdown += `| ${param.PARAMETER_NAME} | ${param.DATA_TYPE} | ${length} | ${param.PARAMETER_MODE} |\n`;
+                });
+                markdown += '\n';
+            }
+
+            // Definition section
+            if (definitionResult.recordset[0]?.Definition) {
+                markdown += `## Definition\n\n`;
+                markdown += "```sql\n";
+                markdown += definitionResult.recordset[0].Definition;
+                markdown += "\n```\n\n";
+            }
+
+            // Add usage example
+            markdown += `## Usage Example\n\n`;
+            markdown += "```sql\n";
+            let exampleCall = `EXEC ${procInfo.SPECIFIC_SCHEMA}.${procInfo.SPECIFIC_NAME}`;
+            if (paramsResult.recordset.length > 0) {
+                exampleCall += ' ' + paramsResult.recordset
+                    .map(p => `${p.PARAMETER_NAME} = NULL`)
+                    .join(', ');
+            }
+            markdown += exampleCall + "\n";
+            markdown += "```\n";
+
+            return {
+                content: [{
+                    type: "text",
+                    text: markdown
+                }],
+                result: {
+                    procedureInfo: procInfo,
+                    parameters: paramsResult.recordset || [],
+                    definition: definitionResult.recordset[0]?.Definition
+                }
+            };
+        } catch (err) {
+            logger.error(`Error in procedure details tool: ${err.message}`);
+            return {
+                content: [{
+                    type: "text",
+                    text: `Error getting procedure details: ${formatSqlError(err)}`
+                }],
+                isError: true
+            };
+        }
     };
 
-    const schema = { 
-        procedureName: z.string().min(1, "Procedure name cannot be empty") 
-    };
-    
-    if (registerWithAlias) {
-        registerWithAlias("procedure_details", schema, handler);
+    // Register with all aliases
+    if (registerWithAllAliases) {
+        registerWithAllAliases("procedure_details", schema, handler);
     } else {
-        server.tool("mcp_procedure_details", schema, handler);
+        server.tool("procedure_details", schema, handler);
     }
 }
 
@@ -424,127 +569,169 @@ function registerProcedureDetailsTool(server, registerWithAlias) {
  * @param {object} server - MCP server instance 
  * @param {function} registerWithAlias - Optional helper to register with aliases
  */
-function registerFunctionDetailsTool(server, registerWithAlias) {
-    const handler = async ({ functionName }) => {
-            try {
-                // Sanitize function name
-                const sanitizedFuncName = sanitizeSqlIdentifier(functionName);
-                
-                if (sanitizedFuncName !== functionName) {
-                    return {
-                        content: [{
-                            type: "text",
-                            text: `Invalid function name: ${functionName}. Function names should only contain alphanumeric characters and underscores.`
-                        }],
-                        isError: true
-                    };
-                }
-                
-                const result = await executeQuery(`
-                    SELECT 
-                        ROUTINE_DEFINITION,
-                        DATA_TYPE AS RETURN_TYPE
-                    FROM 
-                        INFORMATION_SCHEMA.ROUTINES
-                    WHERE 
-                        ROUTINE_TYPE = 'FUNCTION' AND
-                        ROUTINE_NAME = @functionName
-                `, { functionName: sanitizedFuncName });
-                
-                if (result.recordset.length === 0) {
-                    return {
-                        content: [{
-                            type: "text",
-                            text: `Function '${sanitizedFuncName}' not found.`
-                        }],
-                        isError: true
-                    };
-                }
-                
-                // Get parameters
-                const paramResult = await executeQuery(`
-                    SELECT 
-                        PARAMETER_NAME,
-                        DATA_TYPE,
-                        PARAMETER_MODE
-                    FROM 
-                        INFORMATION_SCHEMA.PARAMETERS
-                    WHERE 
-                        SPECIFIC_NAME = @functionName
-                    ORDER BY 
-                        ORDINAL_POSITION
-                `, { functionName: sanitizedFuncName });
-                
-                let markdown = `# Function: ${sanitizedFuncName}\n\n`;
-                
-                // Add return type
-                markdown += `**Return Type**: ${result.recordset[0].RETURN_TYPE || 'Unknown'}\n\n`;
-                
-                if (paramResult.recordset.length > 0) {
-                    markdown += '## Parameters\n\n';
-                    markdown += '| Name | Type | Mode |\n';
-                    markdown += '|------|------|------|\n';
-                    
-                    paramResult.recordset.forEach(param => {
-                        markdown += `| ${param.PARAMETER_NAME} | ${param.DATA_TYPE} | ${param.PARAMETER_MODE} |\n`;
-                    });
-                    
-                    markdown += '\n';
-                }
-                
-                markdown += '## Definition\n\n';
-                markdown += '```sql\n';
-                markdown += result.recordset[0].ROUTINE_DEFINITION || 'Definition not available';
-                markdown += '\n```\n';
-                
-                // Add usage example
-                markdown += '\n## Usage Example\n\n';
-                markdown += '```sql\n';
-                
-                // Simple scalar function example
-                if (paramResult.recordset.length === 0) {
-                    markdown += `-- Call scalar function\n`;
-                    markdown += `SELECT dbo.${sanitizedFuncName}() AS Result\n`;
-                } else {
-                    markdown += `-- Call function with parameters\n`;
-                    markdown += `SELECT dbo.${sanitizedFuncName}(${paramResult.recordset.map(() => '?').join(', ')}) AS Result\n`;
-                }
-                
-                markdown += '```\n';
-                
+function registerFunctionDetailsTool(server, registerWithAllAliases) {
+    const schema = {
+        functionName: z.string(),
+        random_string: z.string().optional()
+    };
+
+    const handler = async (args) => {
+        // Initialize all result variables
+        let funcInfoResult = { recordset: [] };
+        let paramsResult = { recordset: [] };
+        let returnTypeResult = { recordset: [] };
+        let definitionResult = { recordset: [] };
+
+        try {
+            // Get function info
+            funcInfoResult = await executeQuery(`
+                SELECT 
+                    SPECIFIC_SCHEMA,
+                    SPECIFIC_NAME,
+                    ROUTINE_TYPE,
+                    DATA_TYPE AS RETURN_TYPE,
+                    CREATED,
+                    LAST_ALTERED
+                FROM 
+                    INFORMATION_SCHEMA.ROUTINES
+                WHERE 
+                    ROUTINE_TYPE = 'FUNCTION'
+                    AND SPECIFIC_NAME = @functionName
+            `, {
+                functionName: args.functionName
+            });
+
+            if (!funcInfoResult.recordset.length) {
                 return {
                     content: [{
                         type: "text",
-                        text: markdown
-                }],
-                result: {
-                    functionName: sanitizedFuncName,
-                    returnType: result.recordset[0].RETURN_TYPE || 'Unknown',
-                    parameters: paramResult.recordset || [],
-                    definition: result.recordset[0].ROUTINE_DEFINITION || 'Definition not available'
-                }
-                };
-            } catch (err) {
-                logger.error(`Error getting function details: ${err.message}`);
-                
-                return {
-                    content: [{
-                        type: "text",
-                        text: `Error getting function details: ${formatSqlError(err)}`
+                        text: `Function '${args.functionName}' not found.`
                     }],
                     isError: true
                 };
             }
+
+            // Get parameters
+            paramsResult = await executeQuery(`
+                SELECT 
+                    PARAMETER_NAME,
+                    DATA_TYPE,
+                    CHARACTER_MAXIMUM_LENGTH,
+                    PARAMETER_MODE
+                FROM 
+                    INFORMATION_SCHEMA.PARAMETERS
+                WHERE 
+                    SPECIFIC_NAME = @functionName
+                    AND PARAMETER_NAME IS NOT NULL
+                ORDER BY 
+                    ORDINAL_POSITION
+            `, {
+                functionName: args.functionName
+            });
+
+            // Get return type details
+            returnTypeResult = await executeQuery(`
+                SELECT 
+                    DATA_TYPE,
+                    CHARACTER_MAXIMUM_LENGTH
+                FROM 
+                    INFORMATION_SCHEMA.PARAMETERS
+                WHERE 
+                    SPECIFIC_NAME = @functionName
+                    AND PARAMETER_NAME IS NULL
+            `, {
+                functionName: args.functionName
+            });
+
+            // Get function definition
+            definitionResult = await executeQuery(`
+                SELECT 
+                    OBJECT_DEFINITION(OBJECT_ID(@functionName)) AS Definition
+            `, {
+                functionName: args.functionName
+            });
+
+            // Format the output as markdown
+            const funcInfo = funcInfoResult.recordset[0];
+            let markdown = `# Function: ${funcInfo.SPECIFIC_SCHEMA}.${funcInfo.SPECIFIC_NAME}\n\n`;
+
+            // Add creation and modification dates
+            markdown += `Created: ${funcInfo.CREATED}\n`;
+            markdown += `Last Modified: ${funcInfo.LAST_ALTERED}\n\n`;
+
+            // Return type section
+            const returnType = returnTypeResult.recordset[0];
+            if (returnType) {
+                markdown += `## Return Type\n\n`;
+                const length = returnType.CHARACTER_MAXIMUM_LENGTH === -1 ? 'MAX' : 
+                             returnType.CHARACTER_MAXIMUM_LENGTH || '';
+                markdown += `${returnType.DATA_TYPE}${length ? `(${length})` : ''}\n\n`;
+            }
+
+            // Parameters section
+            if (paramsResult.recordset.length > 0) {
+                markdown += `## Parameters\n\n`;
+                markdown += `| Parameter | Type | Length | Mode |\n`;
+                markdown += `| --------- | ---- | ------ | ---- |\n`;
+                paramsResult.recordset.forEach(param => {
+                    const length = param.CHARACTER_MAXIMUM_LENGTH === -1 ? 'MAX' : 
+                                 param.CHARACTER_MAXIMUM_LENGTH || '';
+                    markdown += `| ${param.PARAMETER_NAME} | ${param.DATA_TYPE} | ${length} | ${param.PARAMETER_MODE} |\n`;
+                });
+                markdown += '\n';
+            }
+
+            // Definition section
+            if (definitionResult.recordset[0]?.Definition) {
+                markdown += `## Definition\n\n`;
+                markdown += "```sql\n";
+                markdown += definitionResult.recordset[0].Definition;
+                markdown += "\n```\n\n";
+            }
+
+            // Add usage example
+            markdown += `## Usage Example\n\n`;
+            markdown += "```sql\n";
+            let exampleCall = `SELECT ${funcInfo.SPECIFIC_SCHEMA}.${funcInfo.SPECIFIC_NAME}`;
+            if (paramsResult.recordset.length > 0) {
+                exampleCall += '(' + paramsResult.recordset
+                    .map(p => 'NULL')
+                    .join(', ') + ')';
+            } else {
+                exampleCall += '()';
+            }
+            markdown += exampleCall + "\n";
+            markdown += "```\n";
+
+            return {
+                content: [{
+                    type: "text",
+                    text: markdown
+                }],
+                result: {
+                    functionInfo: funcInfo,
+                    parameters: paramsResult.recordset || [],
+                    returnType: returnTypeResult.recordset[0] || null,
+                    definition: definitionResult.recordset[0]?.Definition
+                }
+            };
+        } catch (err) {
+            logger.error(`Error in function details tool: ${err.message}`);
+            return {
+                content: [{
+                    type: "text",
+                    text: `Error getting function details: ${formatSqlError(err)}`
+                }],
+                isError: true
+            };
+        }
     };
 
-    const schema = { 
-        functionName: z.string().min(1, "Function name cannot be empty") 
-    };
-    
-    if (registerWithAlias) {
-        registerWithAlias("function_details", schema, handler);
+    // Register with all aliases
+    if (registerWithAllAliases) {
+        registerWithAllAliases("function_details", schema, handler);
     } else {
-        server.tool("mcp_function_details", schema, handler);
+        server.tool("function_details", schema, handler);
     }
 }
 
@@ -553,113 +740,191 @@ function registerFunctionDetailsTool(server, registerWithAlias) {
  * @param {object} server - MCP server instance
  * @param {function} registerWithAlias - Optional helper to register with aliases
  */
-function registerViewDetailsTool(server, registerWithAlias) {
-    const handler = async ({ viewName }) => {
-            try {
-                // Sanitize view name
-                const sanitizedViewName = sanitizeSqlIdentifier(viewName);
-                
-                if (sanitizedViewName !== viewName) {
-                    return {
-                        content: [{
-                            type: "text",
-                            text: `Invalid view name: ${viewName}. View names should only contain alphanumeric characters and underscores.`
-                        }],
-                        isError: true
-                    };
-                }
-                
-                const result = await executeQuery(`
-                    SELECT 
-                        VIEW_DEFINITION
-                    FROM 
-                        INFORMATION_SCHEMA.VIEWS
-                    WHERE 
-                        TABLE_NAME = @viewName
-                `, { viewName: sanitizedViewName });
-                
-                if (result.recordset.length === 0) {
-                    return {
-                        content: [{
-                            type: "text",
-                            text: `View '${sanitizedViewName}' not found.`
-                        }],
-                        isError: true
-                    };
-                }
-                
-                // Get columns
-                const columnResult = await executeQuery(`
-                    SELECT 
-                        COLUMN_NAME,
-                        DATA_TYPE,
-                        IS_NULLABLE
-                    FROM 
-                        INFORMATION_SCHEMA.COLUMNS
-                    WHERE 
-                        TABLE_NAME = @viewName
-                    ORDER BY 
-                        ORDINAL_POSITION
-                `, { viewName: sanitizedViewName });
-                
-                let markdown = `# View: ${sanitizedViewName}\n\n`;
-                
-                if (columnResult.recordset.length > 0) {
-                    markdown += '## Columns\n\n';
-                    markdown += '| Name | Type | Nullable |\n';
-                    markdown += '|------|------|----------|\n';
-                    
-                    columnResult.recordset.forEach(col => {
-                        markdown += `| ${col.COLUMN_NAME} | ${col.DATA_TYPE} | ${col.IS_NULLABLE} |\n`;
-                    });
-                    
-                    markdown += '\n';
-                }
-                
-                markdown += '## Definition\n\n';
-                markdown += '```sql\n';
-                markdown += result.recordset[0].VIEW_DEFINITION || 'Definition not available';
-                markdown += '\n```\n';
-                
-                // Add usage example
-                markdown += '\n## Usage Example\n\n';
-                markdown += '```sql\n';
-                markdown += `-- Query the view\n`;
-                markdown += `SELECT TOP 100 * FROM [${sanitizedViewName}]\n`;
-                markdown += '```\n';
-                
+function registerViewDetailsTool(server, registerWithAllAliases) {
+    const schema = {
+        viewName: z.string(),
+        random_string: z.string().optional()
+    };
+
+    const handler = async (args) => {
+        // Initialize all result variables
+        let viewInfoResult = { recordset: [] };
+        let columnsResult = { recordset: [] };
+        let definitionResult = { recordset: [] };
+        let indexesResult = { recordset: [] };
+        let rowCountResult = { recordset: [] };
+
+        try {
+            // Get view info
+            viewInfoResult = await executeQuery(`
+                SELECT 
+                    TABLE_SCHEMA,
+                    TABLE_NAME,
+                    CHECK_OPTION,
+                    IS_UPDATABLE
+                FROM 
+                    INFORMATION_SCHEMA.VIEWS
+                WHERE 
+                    TABLE_NAME = @viewName
+            `, {
+                viewName: args.viewName
+            });
+
+            if (!viewInfoResult.recordset.length) {
                 return {
                     content: [{
                         type: "text",
-                        text: markdown
-                }],
-                result: {
-                    viewName: sanitizedViewName,
-                    columns: columnResult.recordset || [],
-                    definition: result.recordset[0].VIEW_DEFINITION || 'Definition not available'
-                }
-                };
-            } catch (err) {
-                logger.error(`Error getting view details: ${err.message}`);
-                
-                return {
-                    content: [{
-                        type: "text",
-                        text: `Error getting view details: ${formatSqlError(err)}`
+                        text: `View '${args.viewName}' not found.`
                     }],
                     isError: true
                 };
             }
+
+            // Get columns
+            columnsResult = await executeQuery(`
+                SELECT 
+                    COLUMN_NAME,
+                    DATA_TYPE,
+                    CHARACTER_MAXIMUM_LENGTH,
+                    IS_NULLABLE,
+                    COLUMN_DEFAULT
+                FROM 
+                    INFORMATION_SCHEMA.COLUMNS
+                WHERE 
+                    TABLE_NAME = @viewName
+                ORDER BY 
+                    ORDINAL_POSITION
+            `, {
+                viewName: args.viewName
+            });
+
+            // Get view definition
+            definitionResult = await executeQuery(`
+                SELECT 
+                    OBJECT_DEFINITION(OBJECT_ID(@viewName)) AS Definition
+            `, {
+                viewName: args.viewName
+            });
+
+            // Get indexes
+            indexesResult = await executeQuery(`
+                SELECT 
+                    i.name AS IndexName,
+                    i.type_desc AS IndexType,
+                    STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS Columns,
+                    i.is_unique AS IsUnique
+                FROM 
+                    sys.indexes i
+                    INNER JOIN sys.views v ON i.object_id = v.object_id
+                    INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+                    INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                WHERE 
+                    v.name = @viewName
+                GROUP BY
+                    i.name, i.type_desc, i.is_unique
+            `, {
+                viewName: args.viewName
+            });
+
+            // Get approximate row count
+            rowCountResult = await executeQuery(`
+                SELECT 
+                    p.rows AS [RowCount]
+                FROM 
+                    sys.views v
+                    INNER JOIN sys.partitions p ON v.object_id = p.object_id
+                WHERE 
+                    v.name = @viewName
+                    AND p.index_id IN (0,1)
+            `, {
+                viewName: args.viewName
+            });
+
+            // Format the output as markdown
+            const viewInfo = viewInfoResult.recordset[0];
+            let markdown = `# View: ${viewInfo.TABLE_SCHEMA}.${viewInfo.TABLE_NAME}\n\n`;
+
+            // Add view properties
+            markdown += `- Is Updatable: ${viewInfo.IS_UPDATABLE}\n`;
+            if (viewInfo.CHECK_OPTION) {
+                markdown += `- Check Option: ${viewInfo.CHECK_OPTION}\n`;
+            }
+
+            // Add row count if available
+            if (rowCountResult.recordset.length > 0) {
+                markdown += `- Approximate row count: ${rowCountResult.recordset[0].RowCount}\n`;
+            }
+            markdown += '\n';
+
+            // Columns section
+            markdown += `## Columns\n\n`;
+            markdown += `| Column | Type | Length | Nullable | Default |\n`;
+            markdown += `| ------ | ---- | ------ | -------- | ------- |\n`;
+            columnsResult.recordset.forEach(col => {
+                const length = col.CHARACTER_MAXIMUM_LENGTH === -1 ? 'MAX' : 
+                             col.CHARACTER_MAXIMUM_LENGTH || '';
+                markdown += `| ${col.COLUMN_NAME} | ${col.DATA_TYPE} | ${length} | ${col.IS_NULLABLE} | ${col.COLUMN_DEFAULT || ''} |\n`;
+            });
+
+            // Indexes section
+            if (indexesResult.recordset.length > 0) {
+                markdown += `\n## Indexes\n\n`;
+                markdown += `| Name | Type | Columns | Unique |\n`;
+                markdown += `| ---- | ---- | ------- | ------ |\n`;
+                indexesResult.recordset.forEach(idx => {
+                    markdown += `| ${idx.IndexName} | ${idx.IndexType} | ${idx.Columns} | ${idx.IsUnique ? 'Yes' : 'No'} |\n`;
+                });
+            }
+
+            // Definition section
+            if (definitionResult.recordset[0]?.Definition) {
+                markdown += `\n## Definition\n\n`;
+                markdown += "```sql\n";
+                markdown += definitionResult.recordset[0].Definition;
+                markdown += "\n```\n\n";
+            }
+
+            // Add usage examples
+            markdown += `## Usage Examples\n\n`;
+            markdown += `### Query View\n`;
+            markdown += "```sql\n";
+            markdown += `SELECT TOP 10 * FROM ${viewInfo.TABLE_SCHEMA}.${viewInfo.TABLE_NAME}\n`;
+            markdown += "```\n\n";
+            markdown += `### Count Rows\n`;
+            markdown += "```sql\n";
+            markdown += `SELECT COUNT(*) FROM ${viewInfo.TABLE_SCHEMA}.${viewInfo.TABLE_NAME}\n`;
+            markdown += "```\n";
+
+            return {
+                content: [{
+                    type: "text",
+                    text: markdown
+                }],
+                result: {
+                    viewInfo: viewInfo,
+                    columns: columnsResult.recordset || [],
+                    indexes: indexesResult.recordset || [],
+                    definition: definitionResult.recordset[0]?.Definition,
+                    rowCount: rowCountResult.recordset[0]?.RowCount
+                }
+            };
+        } catch (err) {
+            logger.error(`Error in view details tool: ${err.message}`);
+            return {
+                content: [{
+                    type: "text",
+                    text: `Error getting view details: ${formatSqlError(err)}`
+                }],
+                isError: true
+            };
+        }
     };
 
-    const schema = { 
-        viewName: z.string().min(1, "View name cannot be empty") 
-    };
-    
-    if (registerWithAlias) {
-        registerWithAlias("view_details", schema, handler);
+    // Register with all aliases
+    if (registerWithAllAliases) {
+        registerWithAllAliases("view_details", schema, handler);
     } else {
-        server.tool("mcp_view_details", schema, handler);
+        server.tool("view_details", schema, handler);
     }
 }
 
@@ -668,157 +933,209 @@ function registerViewDetailsTool(server, registerWithAlias) {
  * @param {object} server - MCP server instance
  * @param {function} registerWithAlias - Optional helper to register with aliases
  */
-function registerIndexDetailsTool(server, registerWithAlias) {
-    const handler = async ({ tableName, indexName }) => {
-            try {
-                // Sanitize names
-                const sanitizedTableName = sanitizeSqlIdentifier(tableName);
-                const sanitizedIndexName = sanitizeSqlIdentifier(indexName);
-                
-                if (sanitizedTableName !== tableName || sanitizedIndexName !== indexName) {
-                    return {
-                        content: [{
-                            type: "text",
-                            text: `Invalid table or index name. Names should only contain alphanumeric characters and underscores.`
-                        }],
-                        isError: true
-                    };
-                }
-                
-                const result = await executeQuery(`
-                    SELECT 
-                        i.name AS IndexName,
-                        i.type_desc AS IndexType,
-                        i.is_unique AS IsUnique,
-                        i.is_primary_key AS IsPrimaryKey,
-                        i.is_unique_constraint AS IsUniqueConstraint,
-                        c.name AS ColumnName,
-                        ic.is_descending_key AS IsDescending,
-                        ic.is_included_column AS IsIncluded
-                    FROM 
-                        sys.indexes i
-                    INNER JOIN 
-                        sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-                    INNER JOIN 
-                        sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
-                    INNER JOIN 
-                        sys.tables t ON i.object_id = t.object_id
-                    WHERE 
-                        t.name = @tableName AND
-                        i.name = @indexName
-                    ORDER BY 
-                        ic.key_ordinal
-                `, { 
-                    tableName: sanitizedTableName, 
-                    indexName: sanitizedIndexName 
-                });
-                
-                if (result.recordset.length === 0) {
-                    return {
-                        content: [{
-                            type: "text",
-                            text: `Index '${sanitizedIndexName}' on table '${sanitizedTableName}' not found.`
-                        }],
-                        isError: true
-                    };
-                }
-                
-                let markdown = `# Index: ${sanitizedIndexName}\n\n`;
-                markdown += `**Table**: ${sanitizedTableName}\n\n`;
-                markdown += `**Type**: ${result.recordset[0].IndexType}\n\n`;
-                markdown += `**Unique**: ${result.recordset[0].IsUnique ? 'Yes' : 'No'}\n\n`;
-                markdown += `**Primary Key**: ${result.recordset[0].IsPrimaryKey ? 'Yes' : 'No'}\n\n`;
-                markdown += `**Unique Constraint**: ${result.recordset[0].IsUniqueConstraint ? 'Yes' : 'No'}\n\n`;
-                
-                // Split into key columns and included columns
-                const keyColumns = result.recordset.filter(r => !r.IsIncluded);
-                const includedColumns = result.recordset.filter(r => r.IsIncluded);
-                
-                markdown += '## Key Columns\n\n';
-                markdown += '| Column | Sort Direction |\n';
-                markdown += '|--------|---------------|\n';
-                
-                keyColumns.forEach(col => {
-                    markdown += `| ${col.ColumnName} | ${col.IsDescending ? 'Descending' : 'Ascending'} |\n`;
-                });
-                
-                if (includedColumns.length > 0) {
-                    markdown += '\n## Included Columns\n\n';
-                    markdown += '| Column |\n';
-                    markdown += '|--------|\n';
-                    
-                    includedColumns.forEach(col => {
-                        markdown += `| ${col.ColumnName} |\n`;
-                    });
-                }
-                
-                // Add index usage query example
-                markdown += '\n## Index Usage Query\n\n';
-                markdown += '```sql\n';
-                markdown += `-- Get index usage statistics\n`;
-                markdown += `SELECT\n`;
-                markdown += `    s.name AS SchemaName,\n`;
-                markdown += `    t.name AS TableName,\n`;
-                markdown += `    i.name AS IndexName,\n`;
-                markdown += `    ius.user_seeks AS Seeks,\n`;
-                markdown += `    ius.user_scans AS Scans,\n`;
-                markdown += `    ius.user_lookups AS Lookups,\n`;
-                markdown += `    ius.user_updates AS Updates,\n`;
-                markdown += `    ius.last_user_seek AS LastSeek,\n`;
-                markdown += `    ius.last_user_scan AS LastScan,\n`;
-                markdown += `    ius.last_user_lookup AS LastLookup,\n`;
-                markdown += `    ius.last_user_update AS LastUpdate\n`;
-                markdown += `FROM\n`;
-                markdown += `    sys.indexes i\n`;
-                markdown += `INNER JOIN\n`;
-                markdown += `    sys.tables t ON i.object_id = t.object_id\n`;
-                markdown += `INNER JOIN\n`;
-                markdown += `    sys.schemas s ON t.schema_id = s.schema_id\n`;
-                markdown += `LEFT JOIN\n`;
-                markdown += `    sys.dm_db_index_usage_stats ius ON i.object_id = ius.object_id AND i.index_id = ius.index_id\n`;
-                markdown += `WHERE\n`;
-                markdown += `    t.name = '${sanitizedTableName}'\n`;
-                markdown += `    AND i.name = '${sanitizedIndexName}'\n`;
-                markdown += '```\n';
-                
+function registerIndexDetailsTool(server, registerWithAllAliases) {
+    const schema = {
+        tableName: z.string(),
+        indexName: z.string(),
+        random_string: z.string().optional()
+    };
+
+    const handler = async (args) => {
+        // Initialize all result variables
+        let indexInfoResult = { recordset: [] };
+        let indexColumnsResult = { recordset: [] };
+        let indexStatsResult = { recordset: [] };
+        let indexUsageResult = { recordset: [] };
+
+        try {
+            // Get index info
+            indexInfoResult = await executeQuery(`
+                SELECT 
+                    i.name AS IndexName,
+                    i.type_desc AS IndexType,
+                    i.is_unique AS IsUnique,
+                    i.is_primary_key AS IsPrimaryKey,
+                    i.is_unique_constraint AS IsUniqueConstraint,
+                    i.fill_factor AS FillFactor,
+                    i.is_disabled AS IsDisabled,
+                    i.is_padded AS IsPadded,
+                    i.allow_page_locks AS AllowPageLocks,
+                    i.allow_row_locks AS AllowRowLocks
+                FROM 
+                    sys.indexes i
+                    INNER JOIN sys.objects o ON i.object_id = o.object_id
+                WHERE 
+                    o.name = @tableName
+                    AND i.name = @indexName
+            `, {
+                tableName: args.tableName,
+                indexName: args.indexName
+            });
+
+            if (!indexInfoResult.recordset.length) {
                 return {
                     content: [{
                         type: "text",
-                        text: markdown
-                }],
-                result: {
-                    tableName: sanitizedTableName,
-                    indexName: sanitizedIndexName,
-                    type: result.recordset[0].IndexType,
-                    isUnique: result.recordset[0].IsUnique,
-                    isPrimaryKey: result.recordset[0].IsPrimaryKey,
-                    isUniqueConstraint: result.recordset[0].IsUniqueConstraint,
-                    keyColumns: keyColumns.map(col => col.ColumnName),
-                    includedColumns: includedColumns.map(col => col.ColumnName)
-                }
-                };
-            } catch (err) {
-                logger.error(`Error getting index details: ${err.message}`);
-                
-                return {
-                    content: [{
-                        type: "text",
-                        text: `Error getting index details: ${formatSqlError(err)}`
+                        text: `Index '${args.indexName}' not found on table '${args.tableName}'.`
                     }],
                     isError: true
                 };
             }
+
+            // Get index columns
+            indexColumnsResult = await executeQuery(`
+                SELECT 
+                    c.name AS ColumnName,
+                    ic.is_descending_key AS IsDescending,
+                    ic.is_included_column AS IsIncluded,
+                    ic.key_ordinal AS KeyOrdinal
+                FROM 
+                    sys.indexes i
+                    INNER JOIN sys.objects o ON i.object_id = o.object_id
+                    INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+                    INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                WHERE 
+                    o.name = @tableName
+                    AND i.name = @indexName
+                ORDER BY 
+                    ic.key_ordinal
+            `, {
+                tableName: args.tableName,
+                indexName: args.indexName
+            });
+
+            // Get index statistics
+            indexStatsResult = await executeQuery(`
+                SELECT 
+                    ps.avg_fragmentation_in_percent AS FragmentationPercent,
+                    ps.page_count AS PageCount,
+                    ps.avg_page_space_used_in_percent AS PageSpaceUsedPercent
+                FROM 
+                    sys.dm_db_index_physical_stats(DB_ID(), OBJECT_ID(@tableName), 
+                        (SELECT index_id FROM sys.indexes WHERE object_id = OBJECT_ID(@tableName) AND name = @indexName),
+                        NULL, 'LIMITED') ps
+            `, {
+                tableName: args.tableName,
+                indexName: args.indexName
+            });
+
+            // Get index usage stats
+            indexUsageResult = await executeQuery(`
+                SELECT 
+                    ius.user_seeks AS UserSeeks,
+                    ius.user_scans AS UserScans,
+                    ius.user_lookups AS UserLookups,
+                    ius.user_updates AS UserUpdates,
+                    ius.last_user_seek AS LastUserSeek,
+                    ius.last_user_scan AS LastUserScan,
+                    ius.last_user_lookup AS LastUserLookup,
+                    ius.last_user_update AS LastUserUpdate
+                FROM 
+                    sys.dm_db_index_usage_stats ius
+                    INNER JOIN sys.indexes i ON ius.object_id = i.object_id AND ius.index_id = i.index_id
+                    INNER JOIN sys.objects o ON i.object_id = o.object_id
+                WHERE 
+                    o.name = @tableName
+                    AND i.name = @indexName
+                    AND ius.database_id = DB_ID()
+            `, {
+                tableName: args.tableName,
+                indexName: args.indexName
+            });
+
+            // Format the output as markdown
+            const indexInfo = indexInfoResult.recordset[0];
+            let markdown = `# Index: ${args.indexName}\n`;
+            markdown += `On Table: ${args.tableName}\n\n`;
+
+            // Basic properties section
+            markdown += `## Properties\n\n`;
+            markdown += `- Type: ${indexInfo.IndexType}\n`;
+            markdown += `- Is Unique: ${indexInfo.IsUnique ? 'Yes' : 'No'}\n`;
+            markdown += `- Is Primary Key: ${indexInfo.IsPrimaryKey ? 'Yes' : 'No'}\n`;
+            markdown += `- Is Unique Constraint: ${indexInfo.IsUniqueConstraint ? 'Yes' : 'No'}\n`;
+            markdown += `- Fill Factor: ${indexInfo.FillFactor}\n`;
+            markdown += `- Is Disabled: ${indexInfo.IsDisabled ? 'Yes' : 'No'}\n`;
+            markdown += `- Is Padded: ${indexInfo.IsPadded ? 'Yes' : 'No'}\n`;
+            markdown += `- Allow Page Locks: ${indexInfo.AllowPageLocks ? 'Yes' : 'No'}\n`;
+            markdown += `- Allow Row Locks: ${indexInfo.AllowRowLocks ? 'Yes' : 'No'}\n\n`;
+
+            // Columns section
+            markdown += `## Columns\n\n`;
+            markdown += `| Column | Key Order | Direction | Included |\n`;
+            markdown += `| ------ | --------- | --------- | -------- |\n`;
+            indexColumnsResult.recordset.forEach(col => {
+                const keyOrder = col.IsIncluded ? 'N/A' : col.KeyOrdinal;
+                const direction = col.IsIncluded ? 'N/A' : (col.IsDescending ? 'DESC' : 'ASC');
+                markdown += `| ${col.ColumnName} | ${keyOrder} | ${direction} | ${col.IsIncluded ? 'Yes' : 'No'} |\n`;
+            });
+
+            // Statistics section
+            if (indexStatsResult.recordset.length > 0) {
+                const stats = indexStatsResult.recordset[0];
+                markdown += `\n## Physical Statistics\n\n`;
+                markdown += `- Fragmentation: ${stats.FragmentationPercent?.toFixed(2)}%\n`;
+                markdown += `- Page Count: ${stats.PageCount}\n`;
+                markdown += `- Page Space Used: ${stats.PageSpaceUsedPercent?.toFixed(2)}%\n`;
+            }
+
+            // Usage statistics section
+            if (indexUsageResult.recordset.length > 0) {
+                const usage = indexUsageResult.recordset[0];
+                markdown += `\n## Usage Statistics\n\n`;
+                markdown += `### Operation Counts\n`;
+                markdown += `- Seeks: ${usage.UserSeeks}\n`;
+                markdown += `- Scans: ${usage.UserScans}\n`;
+                markdown += `- Lookups: ${usage.UserLookups}\n`;
+                markdown += `- Updates: ${usage.UserUpdates}\n\n`;
+                
+                markdown += `### Last Operations\n`;
+                markdown += `- Last Seek: ${usage.LastUserSeek || 'Never'}\n`;
+                markdown += `- Last Scan: ${usage.LastUserScan || 'Never'}\n`;
+                markdown += `- Last Lookup: ${usage.LastUserLookup || 'Never'}\n`;
+                markdown += `- Last Update: ${usage.LastUserUpdate || 'Never'}\n`;
+            }
+
+            // Add maintenance examples
+            markdown += `\n## Maintenance Examples\n\n`;
+            markdown += `### Rebuild Index\n`;
+            markdown += "```sql\n";
+            markdown += `ALTER INDEX [${args.indexName}] ON [${args.tableName}] REBUILD;\n`;
+            markdown += "```\n\n";
+            markdown += `### Reorganize Index\n`;
+            markdown += "```sql\n";
+            markdown += `ALTER INDEX [${args.indexName}] ON [${args.tableName}] REORGANIZE;\n`;
+            markdown += "```\n";
+
+            return {
+                content: [{
+                    type: "text",
+                    text: markdown
+                }],
+                result: {
+                    indexInfo: indexInfo,
+                    columns: indexColumnsResult.recordset || [],
+                    statistics: indexStatsResult.recordset[0] || null,
+                    usage: indexUsageResult.recordset[0] || null
+                }
+            };
+        } catch (err) {
+            logger.error(`Error in index details tool: ${err.message}`);
+            return {
+                content: [{
+                    type: "text",
+                    text: `Error getting index details: ${formatSqlError(err)}`
+                }],
+                isError: true
+            };
+        }
     };
 
-    const schema = { 
-        tableName: z.string().min(1, "Table name cannot be empty"),
-        indexName: z.string().min(1, "Index name cannot be empty")
-    };
-    
-    if (registerWithAlias) {
-        registerWithAlias("index_details", schema, handler);
+    // Register with all aliases
+    if (registerWithAllAliases) {
+        registerWithAllAliases("index_details", schema, handler);
     } else {
-        server.tool("mcp_index_details", schema, handler);
+        server.tool("index_details", schema, handler);
     }
 }
 
@@ -1004,183 +1321,160 @@ function registerDiscoverTablesTool(server, registerWithAlias) {
  */
 function registerDiscoverDatabaseTool(server, registerWithAlias) {
     const handler = async ({ type = 'all', limit = 100 }) => {
-            try {
-                let markdown = `# SQL Server Database Discovery\n\n`;
-                
-                // Discover tables
-                if (type === 'tables' || type === 'all') {
-                    const tablesQuery = `
-                        SELECT TOP ${limit}
-                            TABLE_SCHEMA,
-                            TABLE_NAME
-                        FROM 
-                            INFORMATION_SCHEMA.TABLES
-                        WHERE 
-                            TABLE_TYPE = 'BASE TABLE'
-                        ORDER BY 
-                            TABLE_SCHEMA, TABLE_NAME
-                    `;
-                    
-                    const tablesResult = await executeQuery(tablesQuery);
-                    
-                    markdown += `## Tables (${tablesResult.recordset.length})\n\n`;
-                    
-                    if (tablesResult.recordset.length > 0) {
-                        markdown += '| Schema | Table Name |\n';
-                        markdown += '|--------|------------|\n';
-                        
-                        tablesResult.recordset.forEach(table => {
-                            markdown += `| ${table.TABLE_SCHEMA} | ${table.TABLE_NAME} |\n`;
-                        });
-                        
-                        markdown += '\n### Example Query:\n';
-                        markdown += '```sql\n';
-                        markdown += `-- Get sample data from a table\n`;
-                        markdown += `SELECT TOP 100 * FROM [${tablesResult.recordset[0].TABLE_SCHEMA}].[${tablesResult.recordset[0].TABLE_NAME}]\n`;
-                        markdown += '```\n\n';
-                    } else {
-                        markdown += 'No tables found.\n\n';
-                    }
+        try {
+            let markdown = `# SQL Server Database Discovery\n\n`;
+
+            // Always define result variables
+            let tablesResult = { recordset: [] };
+            let viewsResult = { recordset: [] };
+            let procsResult = { recordset: [] };
+            let funcsResult = { recordset: [] };
+
+            // Discover tables
+            if (type === 'tables' || type === 'all') {
+                const tablesQuery = `
+                    SELECT TOP ${limit}
+                        TABLE_SCHEMA,
+                        TABLE_NAME
+                    FROM 
+                        INFORMATION_SCHEMA.TABLES
+                    WHERE 
+                        TABLE_TYPE = 'BASE TABLE'
+                    ORDER BY 
+                        TABLE_SCHEMA, TABLE_NAME
+                `;
+                tablesResult = await executeQuery(tablesQuery);
+                markdown += `## Tables (${tablesResult.recordset.length})\n\n`;
+                if (tablesResult.recordset.length > 0) {
+                    markdown += '| Schema | Table Name |\n';
+                    markdown += '|--------|------------|\n';
+                    tablesResult.recordset.forEach(table => {
+                        markdown += `| ${table.TABLE_SCHEMA} | ${table.TABLE_NAME} |\n`;
+                    });
+                    markdown += '\n### Example Query:\n';
+                    markdown += '```sql\n';
+                    markdown += `-- Get sample data from a table\n`;
+                    markdown += `SELECT TOP 100 * FROM [${tablesResult.recordset[0].TABLE_SCHEMA}].[${tablesResult.recordset[0].TABLE_NAME}]\n`;
+                    markdown += '```\n\n';
+                } else {
+                    markdown += 'No tables found.\n\n';
                 }
-                
-                // Discover views
-                if (type === 'views' || type === 'all') {
-                    const viewsQuery = `
-                        SELECT TOP ${limit}
-                            TABLE_SCHEMA,
-                            TABLE_NAME
-                        FROM 
-                            INFORMATION_SCHEMA.VIEWS
-                        ORDER BY 
-                            TABLE_SCHEMA, TABLE_NAME
-                    `;
-                    
-                    const viewsResult = await executeQuery(viewsQuery);
-                    
-                    markdown += `## Views (${viewsResult.recordset.length})\n\n`;
-                    
-                    if (viewsResult.recordset.length > 0) {
-                        markdown += '| Schema | View Name |\n';
-                        markdown += '|--------|----------|\n';
-                        
-                        viewsResult.recordset.forEach(view => {
-                            markdown += `| ${view.TABLE_SCHEMA} | ${view.TABLE_NAME} |\n`;
-                        });
-                        
-                        markdown += '\n### Example Query:\n';
-                        markdown += '```sql\n';
-                        if (viewsResult.recordset.length > 0) {
-                            markdown += `-- Get data from a view\n`;
-                            markdown += `SELECT TOP 100 * FROM [${viewsResult.recordset[0].TABLE_SCHEMA}].[${viewsResult.recordset[0].TABLE_NAME}]\n`;
-                        }
-                        markdown += '```\n\n';
-                    } else {
-                        markdown += 'No views found.\n\n';
-                    }
+            }
+
+            // Discover views
+            if (type === 'views' || type === 'all') {
+                const viewsQuery = `
+                    SELECT TOP ${limit}
+                        TABLE_SCHEMA,
+                        TABLE_NAME
+                    FROM 
+                        INFORMATION_SCHEMA.VIEWS
+                    ORDER BY 
+                        TABLE_SCHEMA, TABLE_NAME
+                `;
+                viewsResult = await executeQuery(viewsQuery);
+                markdown += `## Views (${viewsResult.recordset.length})\n\n`;
+                if (viewsResult.recordset.length > 0) {
+                    markdown += '| Schema | View Name |\n';
+                    markdown += '|--------|----------|\n';
+                    viewsResult.recordset.forEach(view => {
+                        markdown += `| ${view.TABLE_SCHEMA} | ${view.TABLE_NAME} |\n`;
+                    });
+                    markdown += '\n### Example Query:\n';
+                    markdown += '```sql\n';
+                    markdown += `-- Get data from a view\n`;
+                    markdown += `SELECT TOP 100 * FROM [${viewsResult.recordset[0].TABLE_SCHEMA}].[${viewsResult.recordset[0].TABLE_NAME}]\n`;
+                    markdown += '```\n\n';
+                } else {
+                    markdown += 'No views found.\n\n';
                 }
-                
-                // Discover stored procedures
-                if (type === 'procedures' || type === 'all') {
-                    const procsQuery = `
-                        SELECT TOP ${limit}
-                            ROUTINE_SCHEMA,
-                            ROUTINE_NAME
-                        FROM 
-                            INFORMATION_SCHEMA.ROUTINES
-                        WHERE 
-                            ROUTINE_TYPE = 'PROCEDURE'
-                        ORDER BY 
-                            ROUTINE_SCHEMA, ROUTINE_NAME
-                    `;
-                    
-                    const procsResult = await executeQuery(procsQuery);
-                    
-                    markdown += `## Stored Procedures (${procsResult.recordset.length})\n\n`;
-                    
-                    if (procsResult.recordset.length > 0) {
-                        markdown += '| Schema | Procedure Name |\n';
-                        markdown += '|--------|---------------|\n';
-                        
-                        procsResult.recordset.forEach(proc => {
-                            markdown += `| ${proc.ROUTINE_SCHEMA} | ${proc.ROUTINE_NAME} |\n`;
-                        });
-                        
-                        markdown += '\n### Example:\n';
-                        markdown += '```sql\n';
-                        if (procsResult.recordset.length > 0) {
-                            markdown += `-- Get procedure definition\n`;
-                            markdown += `EXEC sp_helptext '${procsResult.recordset[0].ROUTINE_SCHEMA}.${procsResult.recordset[0].ROUTINE_NAME}'\n`;
-                        }
-                        markdown += '```\n\n';
-                    } else {
-                        markdown += 'No stored procedures found.\n\n';
-                    }
+            }
+
+            // Discover stored procedures
+            if (type === 'procedures' || type === 'all') {
+                const procsQuery = `
+                    SELECT TOP ${limit}
+                        ROUTINE_SCHEMA,
+                        ROUTINE_NAME
+                    FROM 
+                        INFORMATION_SCHEMA.ROUTINES
+                    WHERE 
+                        ROUTINE_TYPE = 'PROCEDURE'
+                    ORDER BY 
+                        ROUTINE_SCHEMA, ROUTINE_NAME
+                `;
+                procsResult = await executeQuery(procsQuery);
+                markdown += `## Stored Procedures (${procsResult.recordset.length})\n\n`;
+                if (procsResult.recordset.length > 0) {
+                    markdown += '| Schema | Procedure Name |\n';
+                    markdown += '|--------|---------------|\n';
+                    procsResult.recordset.forEach(proc => {
+                        markdown += `| ${proc.ROUTINE_SCHEMA} | ${proc.ROUTINE_NAME} |\n`;
+                    });
+                    markdown += '\n### Example:\n';
+                    markdown += '```sql\n';
+                    markdown += `-- Get procedure definition\n`;
+                    markdown += `EXEC sp_helptext '${procsResult.recordset[0].ROUTINE_SCHEMA}.${procsResult.recordset[0].ROUTINE_NAME}'\n`;
+                    markdown += '```\n\n';
+                } else {
+                    markdown += 'No stored procedures found.\n\n';
                 }
-                
-                // Discover functions
-                if (type === 'functions' || type === 'all') {
-                    const funcsQuery = `
-                        SELECT TOP ${limit}
-                            ROUTINE_SCHEMA,
-                            ROUTINE_NAME
-                        FROM 
-                            INFORMATION_SCHEMA.ROUTINES
-                        WHERE 
-                            ROUTINE_TYPE = 'FUNCTION'
-                        ORDER BY 
-                            ROUTINE_SCHEMA, ROUTINE_NAME
-                    `;
-                    
-                    const funcsResult = await executeQuery(funcsQuery);
-                    
-                    markdown += `## Functions (${funcsResult.recordset.length})\n\n`;
-                    
-                    if (funcsResult.recordset.length > 0) {
-                        markdown += '| Schema | Function Name |\n';
-                        markdown += '|--------|---------------|\n';
-                        
-                        funcsResult.recordset.forEach(func => {
-                            markdown += `| ${func.ROUTINE_SCHEMA} | ${func.ROUTINE_NAME} |\n`;
-                        });
-                        
-                        markdown += '\n### Example:\n';
-                        markdown += '```sql\n';
-                        if (funcsResult.recordset.length > 0) {
-                            markdown += `-- Get function definition\n`;
-                            markdown += `EXEC sp_helptext '${funcsResult.recordset[0].ROUTINE_SCHEMA}.${funcsResult.recordset[0].ROUTINE_NAME}'\n`;
-                        }
-                        markdown += '```\n\n';
-                    } else {
-                        markdown += 'No functions found.\n\n';
-                    }
+            }
+
+            // Discover functions
+            if (type === 'functions' || type === 'all') {
+                const funcsQuery = `
+                    SELECT TOP ${limit}
+                        ROUTINE_SCHEMA,
+                        ROUTINE_NAME
+                    FROM 
+                        INFORMATION_SCHEMA.ROUTINES
+                    WHERE 
+                        ROUTINE_TYPE = 'FUNCTION'
+                    ORDER BY 
+                        ROUTINE_SCHEMA, ROUTINE_NAME
+                `;
+                funcsResult = await executeQuery(funcsQuery);
+                markdown += `## Functions (${funcsResult.recordset.length})\n\n`;
+                if (funcsResult.recordset.length > 0) {
+                    markdown += '| Schema | Function Name |\n';
+                    markdown += '|--------|---------------|\n';
+                    funcsResult.recordset.forEach(func => {
+                        markdown += `| ${func.ROUTINE_SCHEMA} | ${func.ROUTINE_NAME} |\n`;
+                    });
+                    markdown += '\n### Example:\n';
+                    markdown += '```sql\n';
+                    markdown += `-- Get function definition\n`;
+                    markdown += `EXEC sp_helptext '${funcsResult.recordset[0].ROUTINE_SCHEMA}.${funcsResult.recordset[0].ROUTINE_NAME}'\n`;
+                    markdown += '```\n\n';
+                } else {
+                    markdown += 'No functions found.\n\n';
                 }
-                
-                // Add summary and next steps
-                markdown += '## Next Steps\n\n';
-                markdown += '1. To query a table:\n';
-                markdown += '```javascript\n';
-                markdown += 'mcp__execute_query({ sql: "SELECT TOP 100 * FROM [schema].[table_name]" })\n';
-                markdown += '```\n\n';
-                
-                markdown += '2. To view table structure:\n';
-                markdown += '```javascript\n';
-                markdown += 'mcp__table_details({ tableName: "table_name" })\n';
-                markdown += '```\n\n';
-                
-                markdown += '3. To view view details:\n';
-                markdown += '```javascript\n';
-                markdown += 'mcp__view_details({ viewName: "view_name" })\n';
-                markdown += '```\n\n';
-                
-                markdown += '4. To view procedure details:\n';
-                markdown += '```javascript\n';
-                markdown += 'mcp__procedure_details({ procedureName: "procedure_name" })\n';
-                markdown += '```\n\n';
-                
-                return {
-                    content: [{
-                        type: "text",
-                        text: markdown
+            }
+
+            // Add summary and next steps
+            markdown += '## Next Steps\n\n';
+            markdown += '1. To query a table:\n';
+            markdown += '```javascript\n';
+            markdown += 'mcp__execute_query({ sql: "SELECT TOP 100 * FROM [schema].[table_name]" })\n';
+            markdown += '```\n\n';
+            markdown += '2. To view table structure:\n';
+            markdown += '```javascript\n';
+            markdown += 'mcp__table_details({ tableName: "table_name" })\n';
+            markdown += '```\n\n';
+            markdown += '3. To view view details:\n';
+            markdown += '```javascript\n';
+            markdown += 'mcp__view_details({ viewName: "view_name" })\n';
+            markdown += '```\n\n';
+            markdown += '4. To view procedure details:\n';
+            markdown += '```javascript\n';
+            markdown += 'mcp__procedure_details({ procedureName: "procedure_name" })\n';
+            markdown += '```\n\n';
+
+            return {
+                content: [{
+                    type: "text",
+                    text: markdown
                 }],
                 result: {
                     databaseDiscovery: {
@@ -1190,32 +1484,30 @@ function registerDiscoverDatabaseTool(server, registerWithAlias) {
                         functions: funcsResult.recordset || []
                     }
                 }
-                };
-            } catch (err) {
-                logger.error(`Error discovering database: ${err.message}`);
-                
-                return {
-                    content: [{
-                        type: "text",
-                        text: `Error discovering database: ${formatSqlError(err)}`
-                    }],
-                    isError: true
-                };
-            }
+            };
+        } catch (err) {
+            logger.error(`Error discovering database: ${err.message}`);
+            return {
+                content: [{
+                    type: "text",
+                    text: `Error discovering database: ${formatSqlError(err)}`
+                }],
+                isError: true
+            };
+        }
     };
 
     const schema = { 
         type: z.enum(['tables', 'views', 'procedures', 'functions', 'all']).default('all'),
         limit: z.number().min(1).max(1000).optional().default(100)
     };
-    
+
     if (registerWithAlias) {
         registerWithAlias("discover_database", schema, handler);
     } else {
         server.tool("mcp_discover_database", schema, handler);
     }
 }
-
 /**
  * Register the get-query-results tool
  * @param {object} server - MCP server instance
@@ -1434,37 +1726,43 @@ function registerDiscoverTool(server, registerWithAllAliases) {
     const schema = {
         random_string: z.string().optional()
     };
-    
+
     const handler = async (args) => {
+        // Always define result variables
+        let tablesResult = { recordset: [] };
+        let procsResult = { recordset: [] };
+        let funcsResult = { recordset: [] };
+        let viewsResult = { recordset: [] };
+
         try {
             // Get tables (limited to 100)
-            const tablesResult = await executeQuery(`
+            tablesResult = await executeQuery(`
                 SELECT TOP 100
-                        TABLE_SCHEMA,
+                    TABLE_SCHEMA,
                     TABLE_NAME,
                     TABLE_TYPE
-                    FROM 
-                        INFORMATION_SCHEMA.TABLES
+                FROM 
+                    INFORMATION_SCHEMA.TABLES
                 ORDER BY 
                     TABLE_SCHEMA, TABLE_NAME
             `);
-            
+
             // Get stored procedures (limited to 100)
-            const procsResult = await executeQuery(`
+            procsResult = await executeQuery(`
                 SELECT TOP 100
                     ROUTINE_SCHEMA,
                     ROUTINE_NAME,
                     ROUTINE_TYPE
                 FROM 
                     INFORMATION_SCHEMA.ROUTINES
-                    WHERE 
+                WHERE 
                     ROUTINE_TYPE = 'PROCEDURE'
-                    ORDER BY
+                ORDER BY
                     ROUTINE_SCHEMA, ROUTINE_NAME
             `);
-            
+
             // Get functions (limited to 100)
-            const funcsResult = await executeQuery(`
+            funcsResult = await executeQuery(`
                 SELECT TOP 100
                     ROUTINE_SCHEMA,
                     ROUTINE_NAME,
@@ -1476,94 +1774,84 @@ function registerDiscoverTool(server, registerWithAllAliases) {
                 ORDER BY 
                     ROUTINE_SCHEMA, ROUTINE_NAME
             `);
-            
-            // Get views (actually included in tables with TABLE_TYPE = 'VIEW')
-            const viewsResult = await executeQuery(`
+
+            // Get views
+            viewsResult = await executeQuery(`
                 SELECT TOP 100
                     TABLE_SCHEMA,
-                        TABLE_NAME
+                    TABLE_NAME
                 FROM 
                     INFORMATION_SCHEMA.VIEWS
                 ORDER BY 
                     TABLE_SCHEMA, TABLE_NAME
             `);
-            
+
             // Format the output as markdown
             let markdown = `# Database Overview\n\n`;
-            
+
             // Tables section
             markdown += `## Tables\n\n`;
             markdown += `| Schema | Table | Type |\n`;
             markdown += `| ------ | ----- | ---- |\n`;
-            
             tablesResult.recordset.forEach(table => {
                 markdown += `| ${table.TABLE_SCHEMA} | ${table.TABLE_NAME} | ${table.TABLE_TYPE} |\n`;
             });
-            
             if (tablesResult.recordset.length === 100) {
                 markdown += `\n_Showing first 100 tables. There may be more._\n\n`;
             }
-            
+
             // Stored Procedures section
             markdown += `## Stored Procedures\n\n`;
             markdown += `| Schema | Procedure |\n`;
             markdown += `| ------ | --------- |\n`;
-            
             procsResult.recordset.forEach(proc => {
                 markdown += `| ${proc.ROUTINE_SCHEMA} | ${proc.ROUTINE_NAME} |\n`;
             });
-            
             if (procsResult.recordset.length === 100) {
                 markdown += `\n_Showing first 100 procedures. There may be more._\n\n`;
             }
-            
+
             // Functions section
             markdown += `## Functions\n\n`;
             markdown += `| Schema | Function |\n`;
             markdown += `| ------ | -------- |\n`;
-            
             funcsResult.recordset.forEach(func => {
                 markdown += `| ${func.ROUTINE_SCHEMA} | ${func.ROUTINE_NAME} |\n`;
             });
-            
             if (funcsResult.recordset.length === 100) {
                 markdown += `\n_Showing first 100 functions. There may be more._\n\n`;
             }
-            
+
             // Views section
             markdown += `## Views\n\n`;
             markdown += `| Schema | View |\n`;
             markdown += `| ------ | ---- |\n`;
-            
             viewsResult.recordset.forEach(view => {
                 markdown += `| ${view.TABLE_SCHEMA} | ${view.TABLE_NAME} |\n`;
             });
-            
             if (viewsResult.recordset.length === 100) {
                 markdown += `\n_Showing first 100 views. There may be more._\n\n`;
             }
-            
+
             // Add usage examples
             markdown += `## Usage Examples\n\n`;
             markdown += `### Get Table Details\n`;
             markdown += "```javascript\n";
             markdown += `mcp_table_details({ tableName: "TableName" })\n`;
             markdown += "```\n\n";
-            
             markdown += `### Execute Query\n`;
             markdown += "```javascript\n";
             markdown += `mcp_execute_query({ sql: "SELECT TOP 10 * FROM TableName" })\n`;
             markdown += "```\n\n";
-            
             markdown += `### Get Database Schema\n`;
             markdown += "```javascript\n";
             markdown += `mcp_discover_database()\n`;
             markdown += "```\n";
-            
+
             // Return the result in MCP format with both content and structured data
-                return {
-                    content: [{
-                        type: "text",
+            return {
+                content: [{
+                    type: "text",
                     text: markdown
                 }],
                 result: {
@@ -1572,20 +1860,19 @@ function registerDiscoverTool(server, registerWithAllAliases) {
                     functions: funcsResult.recordset || [],
                     views: viewsResult.recordset || []
                 }
-                };
-            } catch (err) {
+            };
+        } catch (err) {
             logger.error(`Error in discover tool: ${err.message}`);
-                
-                return {
-                    content: [{
-                        type: "text",
+            return {
+                content: [{
+                    type: "text",
                     text: `Error getting database overview: ${formatSqlError(err)}`
-                    }],
-                    isError: true
-                };
-            }
+                }],
+                isError: true
+            };
+        }
     };
-    
+
     // Register with all aliases
     if (registerWithAllAliases) {
         registerWithAllAliases("discover", schema, handler);
@@ -1593,7 +1880,6 @@ function registerDiscoverTool(server, registerWithAllAliases) {
         server.tool("discover", schema, handler);
     }
 }
-
 /**
  * Register the cursor-guide tool
  * @param {object} server - MCP server instance
