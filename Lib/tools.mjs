@@ -321,7 +321,7 @@ function registerTableDetailsTool(server, registerWithAllAliases) {
             // Get approximate row count
             rowCountResult = await executeQuery(`
                 SELECT 
-                    p.rows AS RowCount
+                    p.rows AS [RowCount]
                 FROM 
                     sys.tables t
                     INNER JOIN sys.partitions p ON t.object_id = p.object_id
